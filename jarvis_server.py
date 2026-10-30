@@ -11,7 +11,7 @@ Variables de entorno requeridas:
     TELEGRAM_BOT_TOKEN          — Token del bot (@BotFather)
     TELEGRAM_AUTHORIZED_USER_ID — Tu ID numérico de Telegram
     GEMINI_API_KEY              — Clave de API de Google Gemini
-    GEMINI_MODEL                — (Opcional) Modelo de Gemini (default: gemini-2.5-flash)
+    GEMINI_MODEL                — (Opcional) Modelo de Gemini (default: gemini-flash-lite-latest)
     BRIDGE_SECRET               — Token secreto para autenticar tu laptop
     PORT                        — (Opcional) Puerto del servidor (default: 8888)
 """
@@ -100,7 +100,7 @@ class ServerConfig:
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         auth_user = os.getenv("TELEGRAM_AUTHORIZED_USER_ID", "0").strip()
         gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest").strip()
         bridge_secret = os.getenv("BRIDGE_SECRET", "jarvis_secret_key_2026").strip()
         port = int(os.getenv("PORT", "8888"))
 
@@ -309,8 +309,9 @@ class GeminiClient:
         self._system_instruction = _build_system_instruction()
 
     async def generate(self, history: list[dict[str, str]]) -> str:
+        # Modelos modernos en orden de prioridad
         models_to_try = [self._model]
-        for fallback in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+        for fallback in ("gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-flash-latest", "gemini-pro-latest"):
             if fallback not in models_to_try:
                 models_to_try.append(fallback)
 
@@ -330,25 +331,41 @@ class GeminiClient:
                 endpoint = (
                     f"{GEMINI_BASE_URL}/models/{model_name}:generateContent?key={self._api_key}"
                 )
-                try:
-                    async with session.post(
-                        endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=45)
-                    ) as resp:
-                        if resp.status != 200:
-                            text_err = await resp.text()
-                            logger.warning("Modelo %s falló en servidor (HTTP %d): %s", model_name, resp.status, text_err[:120])
-                            continue
-                        data = await resp.json()
+                max_attempts = 2
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        async with session.post(
+                            endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=45)
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                candidates = data.get("candidates", [])
+                                if candidates:
+                                    parts = candidates[0].get("content", {}).get("parts", [])
+                                    result = "".join(p.get("text", "") for p in parts if "text" in p)
+                                    if result:
+                                        return result
+                                last_error = RuntimeError(f"Modelo {model_name} devolvió una respuesta sin contenido de texto.")
+                                break
 
-                    result = "".join(
-                        p.get("text", "") for p in data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    )
-                    if result:
-                        return result
-                except Exception as exc:
-                    last_error = exc
-                    logger.warning("Excepción con modelo %s en servidor: %s", model_name, exc)
-                    continue
+                            text_err = await resp.text()
+                            last_error = RuntimeError(f"HTTP {resp.status} de Gemini ({model_name}): {text_err[:200]}")
+                            logger.warning(
+                                "Modelo %s falló en servidor (HTTP %d, intento %d/%d): %s",
+                                model_name, resp.status, attempt, max_attempts, text_err[:120]
+                            )
+                            # Si es un error transitorio de carga/saturación, reintentar una vez tras breve espera
+                            if resp.status in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                                await asyncio.sleep(2.0)
+                                continue
+                            break
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning("Excepción con modelo %s en servidor (intento %d/%d): %s", model_name, attempt, max_attempts, exc)
+                        if attempt < max_attempts:
+                            await asyncio.sleep(1.5)
+                            continue
+                        break
 
         raise RuntimeError(f"Error al contactar Gemini con todos los modelos: {last_error}")
 
